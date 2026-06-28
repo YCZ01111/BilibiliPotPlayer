@@ -106,6 +106,17 @@ string ServerLogin(string User, string Pass)
 	if (ConfigData.debug) {
 		HostOpenConsole();
 	}
+	// 读取 Cookie 后重新设置流 URL 的 HTTP header，带上 Cookie。
+	// B 站流 URL（bilivideo.com）对会员/番剧等内容需要 Cookie 验证，
+	// 仅 Referer 会被 403 拒绝，导致 PotPlayer 逐清晰度降级全部失败。
+	// OnInitialize 在配置读取前执行，只能设 Referer；此处补上 Cookie。
+	string urlHeader = "Referer: https://www.bilibili.com\r\n";
+	if (!ConfigData.cookie.empty()) {
+		urlHeader += "Cookie: " + ConfigData.cookie + "\r\n";
+	}
+	HostSetUrlHeaderHTTP("bilivideo.com", urlHeader);
+	HostSetUrlHeaderHTTP("bilivideo.cn", urlHeader);
+	HostSetUrlHeaderHTTP("bilibili.com", urlHeader);
 
 	return "配置文件读取成功，修改完配置文件后需要重启 PotPlayer 才能生效";
 }
@@ -132,6 +143,11 @@ class Config {
 	string subtitleUrl;
 
 	int maxliveroom = 200;
+
+	// yt-dlp 相关配置
+	string ytdlpPath;      // yt-dlp.exe 路径，空则自动查找 Module\yt-dlp.exe
+	string cookieFile;     // Netscape 格式 cookie 文件路径，用于 yt-dlp 登录态
+	bool useYtDlp = true;  // 是否使用 yt-dlp 解析播放（PotPlayer 260114+ 必须 true）
 };
 
 Config ReadConfigFile(string file) {
@@ -182,6 +198,15 @@ Config ReadConfigFile(string file) {
 		}
 		if (root["debug"].isBool()) {
 			config.debug = root["debug"].asBool();
+		}
+		if (root["ytdlpPath"].isString() && !root["ytdlpPath"].asString().empty()) {
+			config.ytdlpPath = root["ytdlpPath"].asString();
+		}
+		if (root["cookieFile"].isString() && !root["cookieFile"].asString().empty()) {
+			config.cookieFile = root["cookieFile"].asString();
+		}
+		if (root["useYtDlp"].isBool()) {
+			config.useYtDlp = root["useYtDlp"].asBool();
 		}
 		if (!config.danmakuServer.empty()) {
 			config.danmakuUrl = config.danmakuServer +  "/subtitle?font=" + HostUrlEncode(config.danmakuFont) + "&font_size=" + config.danmakuFontSize + "&alpha=" + config.danmakuOpacity + "&display_area=" + config.danmakuDisplayArea + "&duration_marquee=" + config.danmakuStayTime + "&duration_still=" + config.danmakuStayTime + "&cid=";
@@ -491,6 +516,16 @@ string Video(string bvid, const string &in path, dictionary &MetaData, array<dic
 	if (res.empty()) {
 		return url;
 	}
+	// 额外请求 MP4 单文件(durl)流作为兜底播放路径。
+	// 新版 PotPlayer 不再支持通过伪造 YouTube itag 触发 DASH 音视频合流，
+	// DASH 流会从 4K 逐清晰度降级全部失败。durl 自带音视频，PotPlayer 可直接
+	// 播放，无需 itag 配对。请求 qn=80(1080P)，B 站会按账号权限返回可用清晰度。
+	string durl_res;
+	if (ispgc) {
+		durl_res = apiPost("/pgc/player/web/playurl?avid=" + aid + "&cid=" + cid + "&qn=80&fnval=16&fourk=1");
+	} else {
+		durl_res = apiPost("/x/player/playurl?avid=" + aid + "&cid=" + cid + "&qn=80&fnval=16&fourk=1");
+	}
 	if (reader.parse(res, root) && root.isObject()) {
 		if (root["code"].asInt() == 0) {
 			JsonValue data;
@@ -639,7 +674,46 @@ string Video(string bvid, const string &in path, dictionary &MetaData, array<dic
 				}
 			}
 		} else {
-			return url;
+		return url;
+	}
+	}
+	// 解析 durl 兜底流：默认播放用 durl（自带音视频，PotPlayer 可直接播放，
+	// 不依赖 itag 伪造）。durl 成功时清空 DASH 项，避免 PotPlayer 先尝试
+	// 失效的 DASH 流（itag 伪造在新版 PotPlayer 已失效）导致逐清晰度降级。
+	if (!durl_res.empty()) {
+		JsonValue durl_root;
+		if (reader.parse(durl_res, durl_root) && durl_root.isObject()) {
+			if (durl_root["code"].asInt() == 0) {
+				JsonValue durl_data;
+				if (ispgc) {
+					durl_data = durl_root["result"];
+				} else {
+					durl_data = durl_root["data"];
+				}
+				JsonValue durl_list = durl_data["durl"];
+				if (durl_list.isArray() && durl_list.size() > 0) {
+					string durl_url = durl_list[0]["url"].asString();
+					int durl_qn = durl_data["quality"].asInt();
+					log("durl fallback", durl_url);
+					// 覆盖默认播放地址为 durl，确保 PotPlayer 能直接开播
+					url = durl_url;
+					if (@QualityList !is null) {
+						// 清空失效的 DASH 项，只保留 durl 直链项
+						QualityList.resize(0);
+						dictionary durl_item;
+						durl_item["url"] = durl_url;
+						durl_item["quality"] = getVideoquality(durl_qn) + " (MP4)";
+						durl_item["qualityDetail"] = durl_item["quality"];
+						durl_item["format"] = "MP4";
+						durl_item["itag"] = 0;
+						QualityList.insertLast(durl_item);
+					}
+				} else {
+					log("durl fallback", "no durl in response");
+				}
+			} else {
+				log("durl fallback code", durl_root["code"].asInt());
+			}
 		}
 	}
 	if (!title.empty()) {
@@ -1570,13 +1644,18 @@ int getTrueItag(int itag) {
 }
 
 int getAudioItag(int id) {
-	array<int> ids = {30280, 30232, 30216};
-	array<int> itags = {327, 256, 139};
+	// 将 B 站音频 id 映射为 PotPlayer 内部 YouTube 音频 itag。
+	// 必须使用 PotPlayer itag 表中仍然有效的音频 itag，否则 PotPlayer 无法
+	// 识别该条目为音频流，导致“有画无声”。
+	// 旧版使用的 256/327 已不在新版 PotPlayer 的 itag 表中，是“没声音”的根因。
+	array<int> ids = {30280, 30232, 30250, 30216};
+	array<int> itags = {251, 140, 251, 139};
 	int idx = ids.find(id);
 	if (idx >= 0) {
 		return itags[idx];
 	}
-	return id;
+	// 未知音频 id 默认使用 140（M4A 128k），最通用的 YouTube 音频 itag
+	return 140;
 }
 
 string getVideoquality(int qn) {
@@ -1903,9 +1982,239 @@ array<dictionary> PlaylistParse(const string &in path) {
 	return result;
 }
 
+//------------------------------------------------------------------------------------------------
+// yt-dlp 播放方案（PotPlayer 260114+）
+// 新版 PotPlayer 移除了通过伪造 itag 配对 DASH 音视频的机制，改用 yt-dlp 解析 B 站流，
+// 配合 HostGetITag 动态申请有效 itag，HostSetUrlRefererHTTP/HostSetUrlCookieHTTP 处理防盗链。
+//------------------------------------------------------------------------------------------------
+
+// 将字符串用双引号包裹（AngelScript 没有 chr() 函数，用转义字符实现）
+string qt(string s) {
+	return "\"" + s + "\"";
+}
+
+// 查找 yt-dlp.exe 路径：优先配置，其次 PotPlayer 安装目录下的 Module\yt-dlp.exe
+string findYtDlpExe() {
+	if (!ConfigData.ytdlpPath.empty() && isFileExists(ConfigData.ytdlpPath)) {
+		return ConfigData.ytdlpPath;
+	}
+	string defaultPath = HostGetExecuteFolder() + "Module\\yt-dlp.exe";
+	if (isFileExists(defaultPath)) {
+		return defaultPath;
+	}
+	return "";
+}
+
+// 调用 yt-dlp.exe 解析 B 站 URL，返回 stdout（JSON）
+// yt-dlp 内置 bilibili extractor，自动处理 WBI 签名、Referer、Cookie
+string execYtDlp(string url) {
+	string exePath = findYtDlpExe();
+	if (exePath.empty()) {
+		log("yt-dlp", "未找到 yt-dlp.exe，请放到 PotPlayer\\Module\\yt-dlp.exe 或在配置文件指定 ytdlpPath");
+		return "";
+	}
+	// 构建命令行参数
+	string options = " --no-playlist --no-warnings --no-check-certificate";
+	options += " --encoding utf8";
+	options += " --add-headers " + qt("Referer: https://www.bilibili.com");
+	// 登录态：优先用 cookie 文件，其次把配置里的 Cookie 字符串转成 header
+	if (!ConfigData.cookieFile.empty() && isFileExists(ConfigData.cookieFile)) {
+		options += " --cookies " + qt(ConfigData.cookieFile);
+	}
+	// 限定格式：优先 mp4/m4a，避免 PotPlayer 对 webm 的兼容问题
+	options += " -f bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best";
+	options += " -j";
+	options += " -- " + url;
+	log("yt-dlp cmd", exePath + options);
+	HostIncTimeOut(60000);
+	string output = HostExecuteProgram(qt(exePath), options);
+	return output;
+}
+
+// 为音视频格式申请 PotPlayer 有效 itag（替代失效的 getTrueItag/getAudioItag 硬编码映射）
+// isVideo=true 视频流，height 高度；isVideo=false 音频流，abr 音频码率
+int allocItag(bool isVideo, int height, int abr, string ext) {
+	int itag = 0;
+	bool isMp4 = (ext == "mp4" || ext == "m4a");
+	bool isWebm = (ext == "webm" || ext == "mkv");
+	if (isVideo) {
+		itag = HostGetITag(height, 0, isMp4, isWebm);
+		if (itag <= 0) itag = HostGetITag(height, 0, true, true);
+	} else {
+		itag = HostGetITag(0, abr, isMp4, isWebm);
+		if (itag <= 0) itag = HostGetITag(0, abr, true, true);
+	}
+	if (itag <= 0) return 0;
+	// 防止 itag 重复占用
+	while (HostExistITag(itag)) itag++;
+	HostSetITag(itag);
+	return itag;
+}
+
+// 解析 yt-dlp 输出的 JSON，填充 QualityList 和 MetaData，返回默认播放 url
+string parseYtDlpJson(string output, dictionary &MetaData, array<dictionary> &QualityList) {
+	if (output.empty()) return "";
+	// yt-dlp -j 每个视频输出一行 JSON，取第一行
+	// HostExecuteProgram 可能混合 stdout 和 stderr，找第一行以 { 开头的即为 JSON
+	array<string> lines = output.split("\n");
+	string jsonStr = "";
+	for (uint i = 0; i < lines.length(); i++) {
+		if (lines[i].find("{") == 0) {
+			jsonStr = lines[i];
+			break;
+		}
+	}
+	if (jsonStr.empty()) {
+		log("yt-dlp", "输出中未找到 JSON 行");
+		return "";
+	}
+	JsonReader reader;
+	JsonValue root;
+	if (!reader.parse(jsonStr, root) || !root.isObject()) {
+		log("yt-dlp", "JSON 解析失败");
+		return "";
+	}
+	// MetaData
+	string title = root["title"].asString();
+	if (!title.empty()) {
+		MetaData["title"] = title;
+		MetaData["content"] = title;
+	}
+	JsonValue thumbnail = root["thumbnail"];
+	if (thumbnail.isString()) {
+		MetaData["thumbnail"] = thumbnail.asString();
+	}
+	JsonValue duration = root["duration"];
+	if (duration.isNumeric()) {
+		MetaData["duration"] = duration.asInt() * 1000;
+	}
+	// 处理 formats 数组，分离 video-only / audio-only / 合流
+	JsonValue formats = root["formats"];
+	if (!formats.isArray() || formats.size() == 0) {
+		// 无 formats（如直播），用 url 字段
+		string directUrl = root["url"].asString();
+		if (!directUrl.empty()) {
+			dictionary item;
+			item["url"] = directUrl;
+			item["quality"] = "直播流";
+			item["qualityDetail"] = "直播流";
+			item["itag"] = 0;
+			QualityList.insertLast(item);
+			return directUrl;
+		}
+		return "";
+	}
+	string bestVideoUrl = "";
+	string bestAudioUrl = "";
+	int bestVideoHeight = 0;
+	int bestAudioAbr = 0;
+	// 遍历找最佳视频流和音频流（DASH 分离）
+	for (uint i = 0; i < formats.size(); i++) {
+		JsonValue fmt = formats[i];
+		string vcodec = fmt["vcodec"].asString();
+		string acodec = fmt["acodec"].asString();
+		int height = fmt["height"].asInt();
+		int abr = fmt["abr"].asInt();
+		string ext = fmt["ext"].asString();
+		string fmtUrl = fmt["url"].asString();
+		bool hasVideo = (vcodec != "" && vcodec != "none");
+		bool hasAudio = (acodec != "" && acodec != "none");
+		if (fmtUrl.empty()) continue;
+		// 注册 Referer/Cookie（从 http_headers 字段）
+		JsonValue httpHeaders = fmt["http_headers"];
+		if (httpHeaders.isObject()) {
+			string referer = httpHeaders["Referer"].asString();
+			if (!referer.empty()) {
+				HostSetUrlRefererHTTP(fmtUrl, referer);
+			}
+		}
+		if (hasVideo && !hasAudio) {
+			// 纯视频流（DASH video）
+			if (height > bestVideoHeight) {
+				bestVideoHeight = height;
+				bestVideoUrl = fmtUrl;
+			}
+			dictionary item;
+			item["url"] = fmtUrl;
+			item["va"] = "v";
+			item["quality"] = "" + height + "p";
+			item["qualityDetail"] = "" + height + "p " + vcodec + " " + ext;
+			item["format"] = ext;
+			int itag = allocItag(true, height, 0, ext);
+			item["itag"] = itag;
+			QualityList.insertLast(item);
+		} else if (!hasVideo && hasAudio) {
+			// 纯音频流（DASH audio）
+			if (abr > bestAudioAbr) {
+				bestAudioAbr = abr;
+				bestAudioUrl = fmtUrl;
+			}
+			dictionary item;
+			item["url"] = fmtUrl;
+			item["va"] = "a";
+			item["quality"] = "" + abr + "K";
+			item["qualityDetail"] = "audio " + acodec + " " + abr + "K " + ext;
+			item["format"] = ext;
+			int itag = allocItag(false, 0, abr, ext);
+			item["itag"] = itag;
+			QualityList.insertLast(item);
+		} else if (hasVideo && hasAudio) {
+			// 合流（mp4），直接可播
+			dictionary item;
+			item["url"] = fmtUrl;
+			item["va"] = "va";
+			item["quality"] = "" + height + "p";
+			item["qualityDetail"] = "" + height + "p " + vcodec + "+" + acodec + " " + ext;
+			item["format"] = ext;
+			int itag = allocItag(true, height, abr, ext);
+			item["itag"] = itag;
+			QualityList.insertLast(item);
+			if (bestVideoUrl.empty()) {
+				bestVideoUrl = fmtUrl;
+			}
+		}
+	}
+	log("yt-dlp", "bestVideo=" + bestVideoHeight + "p bestAudio=" + bestAudioAbr + "K");
+	// DASH 分离流：PotPlayer 按 itag 配对 va="v" 和 va="a"，默认返回视频流 url
+	if (!bestVideoUrl.empty()) {
+		return bestVideoUrl;
+	}
+	return "";
+}
+
+// yt-dlp 播放入口：调用 yt-dlp 解析 B 站 URL 并填充 QualityList
+// 成功返回播放 url，失败返回空串（调用方可回退到原逻辑）
+string playWithYtDlp(string url, dictionary &MetaData, array<dictionary> &QualityList) {
+	if (!ConfigData.useYtDlp) return "";
+	// 注意：本方案需要 PotPlayer 260114+（提供 HostExecuteProgram/HostGetITag 等 API）
+	// 低版本会因找不到 HostExecuteProgram 而编译失败，不会执行到这里
+	string output = execYtDlp(url);
+	if (output.empty()) {
+		log("yt-dlp", "执行返回空");
+		return "";
+	}
+	return parseYtDlpJson(output, MetaData, QualityList);
+}
+
 string PlayitemParse(const string &in path, dictionary &MetaData, array<dictionary> &QualityList) {
 	log("Playitem path", path);
 	status = 2;
+	// yt-dlp 优先路径：番剧(ep/ss)、普通视频(BV)、音频(au) 都交给 yt-dlp 解析
+	// yt-dlp 内置 bilibili extractor，处理 WBI 签名/DASH 音视频配对/防盗链
+	if (ConfigData.useYtDlp && (path.find("/video/BV") >= 0 || path.find("bangumi/play/") >= 0 || path.find("/audio/au") >= 0)) {
+		// 先获取标题等元数据（保留原有番剧信息展示）
+		if (path.find("/video/BV") >= 0) {
+			string bvid = parseBVId(path);
+			// 调用原 Video 函数获取标题（但不使用其返回的失效 url）
+			Video(bvid, path, MetaData, QualityList);
+			QualityList.resize(0);
+		}
+		string ytdlpUrl = playWithYtDlp(path, MetaData, QualityList);
+		if (!ytdlpUrl.empty()) {
+			return ytdlpUrl;
+		}
+		log("yt-dlp", "解析失败，回退到原逻辑");
+	}
 	if (path.find("/video/BV") >= 0) {
 		string bvid = parseBVId(path);
 		return Video(bvid, path, MetaData, QualityList);
