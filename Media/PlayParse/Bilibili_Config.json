@@ -19,5 +19,15 @@
 	},
 	// 播放单个视频时是否显示推荐的视频
 	"showRecommendedVideos": true,
-	"debug": false
+	"debug": false,
+
+	// ===== yt-dlp 播放配置（PotPlayer 260114+ 必需）=====
+	// 新版 PotPlayer 移除了 itag 伪造机制，需要借助 yt-dlp 解析 B 站 DASH 流
+	// 是否使用 yt-dlp 解析播放（true=使用，false=回退到旧逻辑）
+	"useYtDlp": true,
+	// yt-dlp.exe 路径，留空则自动查找 {PotPlayer安装目录}\Module\yt-dlp.exe
+	"ytdlpPath": "",
+	// Netscape 格式的 cookie 文件路径，用于 yt-dlp 登录态（播放会员内容需要）
+	// 可用浏览器扩展 "Get cookies.txt" 导出
+	"cookieFile": ""
 }
